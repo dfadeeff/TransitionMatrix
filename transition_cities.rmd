@@ -21,9 +21,7 @@ When you click the **Knit** button a document will be generated that includes bo
 
 #Clean data
 rm(list = ls(all=TRUE))
-getwd()
-#Set working directories
-setwd("C:/Users/Dimitry Fadeev/Desktop/R/Analysis/Behaviour")
+
 
 #Load library
 library(RODBC)
