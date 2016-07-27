@@ -1,0 +1,217 @@
+---
+title: "Transition_cities"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r, echo=FALSE, results='hide',message=FALSE,warning=FALSE}
+###############################################################################
+#####Analysis of customers
+###############################################################################
+
+#Clean data
+rm(list = ls(all=TRUE))
+getwd()
+#Set working directories
+setwd("C:/Users/Dimitry Fadeev/Desktop/R/Analysis/Behaviour")
+
+#Load library
+library(RODBC)
+library(sqldf)
+#library(dplyr)
+library(lubridate)
+#install.packages("lubridate")
+library(zoo)
+
+#Open connection
+myconn <- odbcConnect("RCube", uid="dmitry.fadeev@zipjet.com", pwd="Sisense")
+myconn
+sqlTables(myconn)
+
+#Create initial query, all customers
+orders <- sqlQuery(myconn, "select o.customer, o.createdAt, o.city, o.voucherCode,
+                   o.reference,c.internalData__segmentation, s.group_median
+                   from [Order Split] o
+                   left join [intwash_customers] c
+                   on o.customer = c._id
+                   left join [Segments_median] s
+                   on s.internalData__segmentation = c.internalData__segmentation
+                   where o.isvalid = 1")
+
+
+#Encode time as Date, orginally it s saved as POSIXct
+orders$createdAt <- as.Date(orders$createdAt, format = '%Y/%m/%d', origin = '1970-01-01')
+
+#Encode as character to make min, max
+orders$newdate <- as.character(orders$createdAt)
+
+#Created dataframe for min and max
+dftime <- sqldf("select customer,
+                min(newdate) as 'first',
+                max(newdate) as 'last' 
+                from orders group by customer")
+
+#Encode data as date class
+dftime$firstDate <- as.Date(dftime$first, origin = '1970-01-01')
+dftime$lastDate <- as.Date(dftime$last, origin = '1970-01-01')
+
+#Create function for handling dates
+som <- function(x) {
+  as.Date(format(x,"%Y-%m-01"))
+}
+
+#Create dates to calculate first date of last and before last months
+startlastMonth <- som(som(Sys.Date()))
+startpreviousMonth <- som(som(Sys.Date())-1)
+
+#Subset from orders to take only those before the first day of the previous month
+orders_untildate <- subset(orders, orders$createdAt < startpreviousMonth)
+
+
+#Create customers data frame
+customers <- sqldf("select o.customer, count(o.reference) as 'countN', d.firstDate, o.createdAt,
+                   (o.createdAt-d.firstDate) / (count(o.reference) - 1 ) as 'ind_frequency', o.city
+                   from orders_untildate o
+                   left join dftime d
+                   on d.customer = o.customer
+                   group by o.customer")
+
+
+#Look at summary statistics
+summary(customers)
+
+#Create recency
+customers$days_since = as.numeric(difftime(time1 = startpreviousMonth,
+                                           time2 = customers$createdAt,
+                                           units = 'days'))
+#Create subset of customer vs median
+segments <- sqldf("select distinct(customer), group_median from orders")
+
+#Add group median by merging datasets and using left join
+customers_all <- merge(x=customers,y=segments, by='customer',all.x = TRUE)
+
+#Convert to numeric
+customers_all$ind_frequency <- as.numeric(customers_all$ind_frequency)
+customers_all$median <- median(customers_all$ind_frequency,na.rm = TRUE)
+
+#Get final frequency
+customers_all$finalfrequency <- ifelse(
+  is.na(customers_all$ind_frequency),
+  ifelse(is.na(customers_all$group_median),
+  customers_all$median,customers_all$group_median),customers_all$ind_frequency)
+
+#Check na in frequency
+any(is.na(customers_all$finalfrequency))
+any(is.na(customers_all$days_since))
+any(is.na(customers_all$countN))
+
+
+#####Apply stages
+customers_all$stages = 'NA'
+table(customers_all$stages)
+customers_all$stages[which(customers_all$countN==1 & customers_all$finalfrequency > customers_all$days_since)] = 'Stage1A'
+customers_all$stages[which(customers_all$countN==2 & customers_all$finalfrequency > customers_all$days_since)] = 'Stage1B'
+customers_all$stages[which(customers_all$countN>2 & customers_all$finalfrequency > customers_all$days_since)] = 'Stage2'
+customers_all$stages[which(customers_all$stages=='NA')] = 'Stage3'
+#Check numbers
+table(customers_all$stages)
+
+#Calculate percentages
+prop.table(table(customers_all$stages))
+
+
+#Create dataframe with customers for next month
+  #First, subset orders to get between dates
+orders_between <- subset(orders,orders$createdAt >= startpreviousMonth &
+                              orders$createdAt < startlastMonth)
+
+  #Second, the subsetted order table is aggregated by customer
+customers_nextmonth <- sqldf("select o.customer, count(o.reference) as 'countN', d.firstDate, o.createdAt,
+                   (o.createdAt-d.firstDate) / (count(o.reference) - 1 ) as 'ind_frequency'
+                   from orders_between o
+                   left join dftime d
+                   on d.customer = o.customer
+                   group by o.customer")
+
+summary(customers_nextmonth)
+
+#Outer join
+newdf <- merge(x=customers_all,y=customers_nextmonth, by='customer',all.x = TRUE)
+#Create final number of orders and dates
+newdf$totalorders <- ifelse(is.na(newdf$countN.y),newdf$countN.x,newdf$countN.x+newdf$countN.y)
+#Enforece last date format
+newdf$lastdate <- as.Date(with(newdf,ifelse(is.na(newdf$createdAt.y),newdf$createdAt.x,newdf$createdAt.y)),origin = '1970-01-01')
+newdf$currentlifespan <- as.numeric(difftime(time1 = newdf$lastdate,
+                                             time2 = newdf$firstDate.x,
+                                             units = 'days')) 
+#Recalculate frequency
+newdf$newfrequency <- newdf$currentlifespan / (newdf$totalorders - 1)
+#Create new frequency of orders
+newdf$newfinalfrequency <- ifelse(is.na(newdf$newfrequency),newdf$finalfrequency,newdf$newfrequency)
+
+newdf$newdays_since = as.numeric(difftime(time1 = startlastMonth,
+                                          time2 = newdf$lastdate,
+                                          units = 'days'))
+
+#Apply new month stages
+newdf$newstages = 'NA'
+table(newdf$newstages)
+newdf$newstages[which(newdf$totalorders==1 & newdf$newfinalfrequency > newdf$newdays_since)] = 'Stage1A'
+newdf$newstages[which(newdf$totalorders==2 & newdf$newfinalfrequency > newdf$newdays_since)] = 'Stage1B'
+newdf$newstages[which(newdf$totalorders > 2 & newdf$newfinalfrequency > newdf$newdays_since)] = 'Stage2'
+newdf$newstages[which(newdf$newstages=='NA')] = 'Stage3'
+#Check numbers
+table(newdf$newstages)
+
+#Old distribution
+prop.table(table(newdf$stages))
+#New distribution
+prop.table(table(newdf$newstages))
+
+
+#Create transition matrix
+#Vertical col shows where they were, horizontal col shows where they went to 
+transition = table(newdf$stages,newdf$newstages)
+print(transition)
+colnames(newdf)
+
+
+#Dont need since function overwrites on every step in the loop
+#dataf <- vector("list",length(unique(newdf$City))) 
+
+dataftable <- vector("list",length(unique(newdf$City)))
+#For loop function
+citynames = unique(newdf$City)
+names(dataftable)=citynames
+
+for ( i in 1:length(citynames)) {
+  dataf=data.frame(newdf[which(newdf$City==citynames[i]),c("City","stages","newstages")])
+  dataftable[[i]] = table(dataf$stages,dataf$newstages)
+}
+
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r}
+#Here London
+dataftable$London/rowSums(dataftable$London)
+#Here Berlin
+dataftable$Berlin/rowSums(dataftable$Berlin)
+#dataftable$Paris/rowSums(dataftable$Paris)
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
